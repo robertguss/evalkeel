@@ -123,6 +123,7 @@ pub struct ConformalSummary {
     pub empirical_coverage: f64,
     pub below_p10_rate: f64,
     pub above_p90_rate: f64,
+    pub crossing_rate: f64,
     pub mean_interval_width: f64,
 }
 
@@ -133,8 +134,8 @@ pub struct CapacitySummary {
     pub within_one_section_accuracy: f64,
     pub under_staffed_rate: f64,
     pub over_staffed_rate: f64,
-    pub total_actual_sections: usize,
-    pub total_pred_sections: usize,
+    pub total_actual_sections: u64,
+    pub total_pred_sections: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,8 +303,12 @@ fn eval_subgroup_binary(group: &str, pairs: &[(f64, f64)], threshold: f64) -> Su
     let positives = pairs.iter().filter(|&&(y, _)| y >= 0.5).count();
     let negatives = n.saturating_sub(positives);
     let base_rate = (positives as f64) / nf;
-    let mean_pred = pairs.iter().map(|&(_, p)| p).sum::<f64>() / nf;
-    let brier = pairs.iter().map(|&(y, p)| (p - y).powi(2)).sum::<f64>() / nf;
+    let mean_pred = pairs.iter().map(|&(_, p)| p.clamp(0.0, 1.0)).sum::<f64>() / nf;
+    let brier = pairs
+        .iter()
+        .map(|&(y, p)| (p.clamp(0.0, 1.0) - y).powi(2))
+        .sum::<f64>()
+        / nf;
     let (ece, _) = calibration_curve(pairs);
     let mut tp = 0usize;
     let mut fp = 0usize;
@@ -344,6 +349,7 @@ fn eval_subgroup_binary(group: &str, pairs: &[(f64, f64)], threshold: f64) -> Su
 pub fn evaluate_binary(
     table: &DataTable,
     source: &str,
+    input_sha256: &str,
     y_col: &str,
     p_col: &str,
     compare_col: Option<&str>,
@@ -358,6 +364,9 @@ pub fn evaluate_binary(
     max_ece: Option<f64>,
     max_group_tpr_gap: Option<f64>,
 ) -> Result<BinaryEvalReport, String> {
+    if max_group_tpr_gap.is_some() && group_col.is_none() {
+        return Err("--max-group-tpr-gap requires --group <col>".to_string());
+    }
     let ys = table
         .columns
         .get(y_col)
@@ -367,6 +376,8 @@ pub fn evaluate_binary(
         .get(p_col)
         .ok_or_else(|| format!("probability column `{p_col}` not found"))?;
 
+    // Keep raw finite `pv` unclamped for rank metrics (ROC-AUC, PR-AUC, Top-K);
+    // clamp strictly to [0, 1] for probabilistic metrics (Brier, Log-Loss, ECE).
     let mut pairs: Vec<(f64, f64)> = Vec::new();
     let mut row_indices: Vec<usize> = Vec::new();
     for idx in 0..table.row_count {
@@ -375,7 +386,7 @@ pub fn evaluate_binary(
             && yv.is_finite()
             && pv.is_finite()
         {
-            pairs.push((if yv >= 0.5 { 1.0 } else { 0.0 }, pv.clamp(0.0, 1.0)));
+            pairs.push((if yv >= 0.5 { 1.0 } else { 0.0 }, pv));
             row_indices.push(idx);
         }
     }
@@ -386,11 +397,23 @@ pub fn evaluate_binary(
     let n = pairs.len();
     let nf = n as f64;
     let positives = pairs.iter().filter(|&&(y, _)| y >= 0.5).count();
+    let has_both_classes = positives > 0 && positives < n;
+    if !has_both_classes && (min_roc_auc.is_some() || min_pr_auc.is_some()) {
+        return Err(
+            "cannot evaluate --min-roc-auc / --min-pr-auc gate on single-class target (all positives or all negatives)"
+                .to_string(),
+        );
+    }
+
     let base_rate = (positives as f64) / nf;
-    let mean_predicted = pairs.iter().map(|&(_, p)| p).sum::<f64>() / nf;
+    let mean_predicted = pairs.iter().map(|&(_, p)| p.clamp(0.0, 1.0)).sum::<f64>() / nf;
     let auc = roc_auc(&pairs).unwrap_or(0.5);
     let ap = average_precision(&pairs).unwrap_or(base_rate);
-    let brier = pairs.iter().map(|&(y, p)| (p - y).powi(2)).sum::<f64>() / nf;
+    let brier = pairs
+        .iter()
+        .map(|&(y, p)| (p.clamp(0.0, 1.0) - y).powi(2))
+        .sum::<f64>()
+        / nf;
     let brier_ref = base_rate * (1.0 - base_rate);
     let brier_skill = if brier_ref > 1e-12 {
         1.0 - brier / brier_ref
@@ -435,20 +458,39 @@ pub fn evaluate_binary(
         0.0
     };
 
-    // Top-K% capture
+    // Tie-aware Top-K% capture (expected capture over tied scores at the cutoff!)
     let mut sorted_desc = pairs.clone();
     sorted_desc.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut top_k = Vec::new();
     for &k_pct in top_k_pcts {
         let k_clamped = k_pct.clamp(0.1, 100.0);
         let n_flag = ((nf * k_clamped / 100.0).ceil() as usize).clamp(1, n);
-        let pos_cap = sorted_desc[..n_flag]
-            .iter()
-            .filter(|&&(y, _)| y >= 0.5)
-            .count();
-        let prec = (pos_cap as f64) / (n_flag as f64);
+        let s_cut = sorted_desc[n_flag - 1].1;
+        let mut strict_n = 0usize;
+        let mut strict_pos = 0usize;
+        let mut tie_total = 0usize;
+        let mut tie_pos = 0usize;
+        for &(y, s) in &sorted_desc {
+            if s > s_cut {
+                strict_n += 1;
+                if y >= 0.5 {
+                    strict_pos += 1;
+                }
+            } else if s == s_cut {
+                tie_total += 1;
+                if y >= 0.5 {
+                    tie_pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        let slots_at_cut = n_flag.saturating_sub(strict_n);
+        let expected_pos = (strict_pos as f64)
+            + ((slots_at_cut as f64) / (tie_total.max(1) as f64)) * (tie_pos as f64);
+        let prec = expected_pos / (n_flag as f64);
         let rec = if positives > 0 {
-            (pos_cap as f64) / (positives as f64)
+            expected_pos / (positives as f64)
         } else {
             0.0
         };
@@ -460,41 +502,57 @@ pub fn evaluate_binary(
         top_k.push(TopKMetric {
             top_k_pct: k_clamped,
             n_flagged: n_flag,
-            positives_captured: pos_cap,
+            positives_captured: expected_pos.round() as usize,
             precision: r4(prec),
             recall: r4(rec),
             lift: r4(lift),
         });
     }
 
-    // Optional baseline comparison
+    // Optional baseline comparison (strictly paired on the exact same matched row subset!)
     let comparison = if let Some(bcol) = compare_col {
         let bs = table
             .columns
             .get(bcol)
             .ok_or_else(|| format!("compare column `{bcol}` not found"))?;
         let mut bpairs = Vec::new();
-        for (&ridx, &(y, _)) in row_indices.iter().zip(pairs.iter()) {
+        let mut matched_cand = Vec::new();
+        for (&ridx, &(y, pv)) in row_indices.iter().zip(pairs.iter()) {
             if let Some(s) = &bs[ridx]
                 && let Ok(bv) = s.parse::<f64>()
                 && bv.is_finite()
             {
-                bpairs.push((y, bv.clamp(0.0, 1.0)));
+                bpairs.push((y, bv));
+                matched_cand.push((y, pv));
             }
         }
         if !bpairs.is_empty() {
+            let b_base_rate =
+                bpairs.iter().filter(|&&(y, _)| y >= 0.5).count() as f64 / (bpairs.len() as f64);
             let b_auc = roc_auc(&bpairs).unwrap_or(0.5);
-            let b_ap = average_precision(&bpairs).unwrap_or(base_rate);
-            let b_brier = bpairs.iter().map(|&(y, p)| (p - y).powi(2)).sum::<f64>()
+            let b_ap = average_precision(&bpairs).unwrap_or(b_base_rate);
+            let b_brier = bpairs
+                .iter()
+                .map(|&(y, p)| (p.clamp(0.0, 1.0) - y).powi(2))
+                .sum::<f64>()
                 / (bpairs.len() as f64);
+
+            let c_auc = roc_auc(&matched_cand).unwrap_or(0.5);
+            let c_ap = average_precision(&matched_cand).unwrap_or(b_base_rate);
+            let c_brier = matched_cand
+                .iter()
+                .map(|&(y, p)| (p.clamp(0.0, 1.0) - y).powi(2))
+                .sum::<f64>()
+                / (matched_cand.len() as f64);
+
             Some(BinaryCompare {
                 baseline_col: bcol.to_string(),
                 baseline_roc_auc: r6(b_auc),
                 baseline_pr_auc: r6(b_ap),
                 baseline_brier: r6(b_brier),
-                delta_roc_auc: r6(auc - b_auc),
-                delta_pr_auc: r6(ap - b_ap),
-                delta_brier: r6(brier - b_brier),
+                delta_roc_auc: r6(c_auc - b_auc),
+                delta_pr_auc: r6(c_ap - b_ap),
+                delta_brier: r6(c_brier - b_brier),
             })
         } else {
             None
@@ -607,16 +665,7 @@ pub fn evaluate_binary(
     }
     let gates_passed = gates.iter().all(|g| g.passed);
 
-    let mut hasher = Sha256::new();
-    hasher.update(
-        format!(
-            "binary:{source}:{n}:{positives}:{auc:.6}:{ap:.6}:{brier:.6}:{ece:.6}"
-        )
-        .as_bytes(),
-    );
-    let sha256: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-
-    Ok(BinaryEvalReport {
+    let mut report = BinaryEvalReport {
         tool: "evalkeel".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         task: "binary".to_string(),
@@ -646,8 +695,14 @@ pub fn evaluate_binary(
         folds,
         gates,
         gates_passed,
-        sha256,
-    })
+        sha256: String::new(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(input_sha256.as_bytes());
+    hasher.update(b"|");
+    hasher.update(serde_json::to_string(&report).unwrap_or_default().as_bytes());
+    report.sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(report)
 }
 
 fn reg_stats(pairs: &[(f64, f64)]) -> (f64, f64, f64, f64, f64, f64) {
@@ -667,13 +722,17 @@ fn reg_stats(pairs: &[(f64, f64)]) -> (f64, f64, f64, f64, f64, f64) {
     let sum_abs_y: f64 = pairs.iter().map(|&(y, _)| y.abs()).sum();
     let wmape = if sum_abs_y > 1e-12 {
         abs_errs.iter().sum::<f64>() / sum_abs_y
-    } else {
+    } else if mae <= 1e-12 {
         0.0
+    } else {
+        f64::INFINITY
     };
     let ss_res: f64 = pairs.iter().map(|&(y, p)| (y - p).powi(2)).sum();
     let ss_tot: f64 = pairs.iter().map(|&(y, _)| (y - mean_y).powi(2)).sum();
     let r2 = if ss_tot > 1e-12 {
         1.0 - ss_res / ss_tot
+    } else if ss_res <= 1e-12 {
+        1.0
     } else {
         0.0
     };
@@ -681,10 +740,15 @@ fn reg_stats(pairs: &[(f64, f64)]) -> (f64, f64, f64, f64, f64, f64) {
     (mae, rmse, medae, wmape, r2, bias)
 }
 
+fn finite_wmape_display(w: f64) -> f64 {
+    if w.is_finite() { r4(w) } else { 999.9999 }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_regress(
     table: &DataTable,
     source: &str,
+    input_sha256: &str,
     y_col: &str,
     pred_col: &str,
     p10_col: Option<&str>,
@@ -698,6 +762,17 @@ pub fn evaluate_regress(
     min_r2: Option<f64>,
     min_coverage: Option<f64>,
 ) -> Result<RegressEvalReport, String> {
+    if p10_col.is_some() != p90_col.is_some() {
+        return Err("both --p10 and --p90 must be provided together".to_string());
+    }
+    if min_coverage.is_some() && (p10_col.is_none() || p90_col.is_none()) {
+        return Err("--min-coverage requires both --p10 and --p90".to_string());
+    }
+    if let Some(c) = cap
+        && (!c.is_finite() || c <= 0.0)
+    {
+        return Err(format!("--cap must be a finite number > 0, got {c}"));
+    }
     let ys = table
         .columns
         .get(y_col)
@@ -729,7 +804,7 @@ pub fn evaluate_regress(
     let mean_predicted = pairs.iter().map(|&(_, p)| p).sum::<f64>() / nf;
     let (mae, rmse, medae, wmape, r2, bias) = reg_stats(&pairs);
 
-    // Optional Conformal P10-P90 interval coverage
+    // Optional Conformal P10-P90 interval coverage (with crossing quantile tracking!)
     let conformal = if let (Some(c10), Some(c90)) = (p10_col, p90_col) {
         let lo_col = table
             .columns
@@ -739,7 +814,8 @@ pub fn evaluate_regress(
             .columns
             .get(c90)
             .ok_or_else(|| format!("p90 column `{c90}` not found"))?;
-        let (mut inside, mut below, mut above, mut valid) = (0usize, 0usize, 0usize, 0usize);
+        let (mut inside, mut below, mut above, mut crossing, mut valid) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut width_sum = 0.0_f64;
         for (&ridx, &(y, _)) in row_indices.iter().zip(pairs.iter()) {
             if let (Some(ls), Some(hs)) = (&lo_col[ridx], &hi_col[ridx])
@@ -748,12 +824,17 @@ pub fn evaluate_regress(
                 && hi.is_finite()
             {
                 valid += 1;
+                if lo > hi {
+                    crossing += 1;
+                }
                 width_sum += (hi - lo).max(0.0);
                 if y < lo {
                     below += 1;
-                } else if y > hi {
+                }
+                if y > hi {
                     above += 1;
-                } else {
+                }
+                if lo <= hi && y >= lo && y <= hi {
                     inside += 1;
                 }
             }
@@ -766,6 +847,7 @@ pub fn evaluate_regress(
                 empirical_coverage: r4((inside as f64) / vf),
                 below_p10_rate: r4((below as f64) / vf),
                 above_p90_rate: r4((above as f64) / vf),
+                crossing_rate: r4((crossing as f64) / vf),
                 mean_interval_width: r4(width_sum / vf),
             })
         } else {
@@ -775,22 +857,27 @@ pub fn evaluate_regress(
         None
     };
 
-    // Optional section/capacity staffing accuracy
-    let capacity = cap.filter(|&c| c > 0.0).map(|cap_val| {
-        let sections = |v: f64| -> usize {
+    // Optional section/capacity staffing accuracy (overflow-safe u64 saturating arithmetic)
+    let capacity = cap.map(|cap_val| {
+        let sections = |v: f64| -> u64 {
             if v <= 0.0 {
                 0
             } else {
-                (v / cap_val).ceil() as usize
+                let raw = (v / cap_val).ceil();
+                if !raw.is_finite() || raw >= (u64::MAX as f64) {
+                    u64::MAX
+                } else {
+                    raw as u64
+                }
             }
         };
         let (mut exact, mut within1, mut under, mut over) = (0usize, 0usize, 0usize, 0usize);
-        let (mut tot_act, mut tot_pred) = (0usize, 0usize);
+        let (mut tot_act, mut tot_pred) = (0u64, 0u64);
         for &(y, p) in &pairs {
             let sa = sections(y);
             let sp = sections(p);
-            tot_act += sa;
-            tot_pred += sp;
+            tot_act = tot_act.saturating_add(sa);
+            tot_pred = tot_pred.saturating_add(sp);
             if sa == sp {
                 exact += 1;
             }
@@ -814,30 +901,37 @@ pub fn evaluate_regress(
         }
     });
 
-    // Optional baseline comparison
+    // Optional baseline comparison (strictly paired on the exact same matched row subset!)
     let comparison = if let Some(bcol) = compare_col {
         let bs = table
             .columns
             .get(bcol)
             .ok_or_else(|| format!("compare column `{bcol}` not found"))?;
         let mut bpairs = Vec::new();
-        for (&ridx, &(y, _)) in row_indices.iter().zip(pairs.iter()) {
+        let mut matched_cand = Vec::new();
+        for (&ridx, &(y, pv)) in row_indices.iter().zip(pairs.iter()) {
             if let Some(s) = &bs[ridx]
                 && let Ok(bv) = s.parse::<f64>()
                 && bv.is_finite()
             {
                 bpairs.push((y, bv));
+                matched_cand.push((y, pv));
             }
         }
         if !bpairs.is_empty() {
             let (b_mae, b_rmse, _, b_wmape, _, _) = reg_stats(&bpairs);
+            let (c_mae, _, _, c_wmape, _, _) = reg_stats(&matched_cand);
             Some(RegressCompare {
                 baseline_col: bcol.to_string(),
                 baseline_mae: r4(b_mae),
                 baseline_rmse: r4(b_rmse),
-                baseline_wmape: r4(b_wmape),
-                delta_mae: r4(mae - b_mae),
-                delta_wmape: r4(wmape - b_wmape),
+                baseline_wmape: finite_wmape_display(b_wmape),
+                delta_mae: r4(c_mae - b_mae),
+                delta_wmape: if c_wmape.is_finite() && b_wmape.is_finite() {
+                    r4(c_wmape - b_wmape)
+                } else {
+                    0.0
+                },
             })
         } else {
             None
@@ -866,7 +960,7 @@ pub fn evaluate_regress(
                         n: gp.len(),
                         mae: r4(gmae),
                         rmse: r4(grmse),
-                        wmape: r4(gwmape),
+                        wmape: finite_wmape_display(gwmape),
                         r2: r4(gr2),
                         bias: r4(gbias),
                     }
@@ -891,8 +985,8 @@ pub fn evaluate_regress(
         gates.push(GateResult {
             metric: "wmape".to_string(),
             rule: format!("<= {mx:.4}"),
-            actual: r4(wmape),
-            passed: wmape <= mx,
+            actual: finite_wmape_display(wmape),
+            passed: wmape.is_finite() && wmape <= mx,
         });
     }
     if let Some(mn) = min_r2 {
@@ -903,21 +997,25 @@ pub fn evaluate_regress(
             passed: r2 >= mn,
         });
     }
-    if let (Some(mn), Some(conf)) = (min_coverage, &conformal) {
-        gates.push(GateResult {
-            metric: "conformal_coverage".to_string(),
-            rule: format!(">= {mn:.4}"),
-            actual: conf.empirical_coverage,
-            passed: conf.empirical_coverage >= mn,
-        });
+    if let Some(mn) = min_coverage {
+        match &conformal {
+            Some(conf) => gates.push(GateResult {
+                metric: "conformal_coverage".to_string(),
+                rule: format!(">= {mn:.4}"),
+                actual: conf.empirical_coverage,
+                passed: conf.empirical_coverage >= mn,
+            }),
+            None => gates.push(GateResult {
+                metric: "conformal_coverage".to_string(),
+                rule: format!(">= {mn:.4}"),
+                actual: 0.0,
+                passed: false,
+            }),
+        }
     }
     let gates_passed = gates.iter().all(|g| g.passed);
 
-    let mut hasher = Sha256::new();
-    hasher.update(format!("regress:{source}:{n}:{mae:.6}:{rmse:.6}:{wmape:.6}:{r2:.6}").as_bytes());
-    let sha256: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-
-    Ok(RegressEvalReport {
+    let mut report = RegressEvalReport {
         tool: "evalkeel".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         task: "regress".to_string(),
@@ -932,7 +1030,7 @@ pub fn evaluate_regress(
         mae: r4(mae),
         rmse: r4(rmse),
         medae: r4(medae),
-        wmape: r4(wmape),
+        wmape: finite_wmape_display(wmape),
         r2: r6(r2),
         bias: r4(bias),
         conformal,
@@ -941,6 +1039,12 @@ pub fn evaluate_regress(
         groups,
         gates,
         gates_passed,
-        sha256,
-    })
+        sha256: String::new(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(input_sha256.as_bytes());
+    hasher.update(b"|");
+    hasher.update(serde_json::to_string(&report).unwrap_or_default().as_bytes());
+    report.sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(report)
 }

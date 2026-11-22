@@ -7,6 +7,7 @@ fn esc(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 const BASE_CSS: &str = r#"
@@ -57,7 +58,7 @@ pub fn render_binary_html(r: &BinaryEvalReport) -> String {
         let rad = (3.5 + (b.count as f64).ln()).clamp(3.5, 9.0);
         svg_circles.push_str(&format!(
             r##"<circle cx="{x:.1}" cy="{y:.1}" r="{rad:.1}" fill="#38bdf8" stroke="#0b1120" stroke-width="1.5"><title>{}: pred={:.1}%, obs={:.1}% (n={})</title></circle>"##,
-            b.range_label,
+            esc(&b.range_label),
             b.mean_predicted * 100.0,
             b.observed_rate * 100.0,
             b.count
@@ -134,6 +135,32 @@ pub fn render_binary_html(r: &BinaryEvalReport) -> String {
         String::new()
     };
 
+    let gates_html = if !r.gates.is_empty() {
+        let rows: String = r
+            .gates
+            .iter()
+            .map(|g| {
+                let pill = if g.passed {
+                    r#"<span class="pill ok">PASS</span>"#
+                } else {
+                    r#"<span class="pill bad">FAIL</span>"#
+                };
+                format!(
+                    r#"<tr><td><strong>{}</strong></td><td>{}</td><td class="num">{:.4}</td><td>{pill}</td></tr>"#,
+                    esc(&g.metric),
+                    esc(&g.rule),
+                    g.actual
+                )
+            })
+            .collect();
+        format!(
+            r#"<div class="card"><h2>CI Quality Gates</h2>
+            <table><thead><tr><th>Metric</th><th>Rule</th><th class="num">Actual</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r##"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -168,6 +195,7 @@ pub fn render_binary_html(r: &BinaryEvalReport) -> String {
     </div>
   </div>
   {fair_html}
+  {gates_html}
   <div class="foot">evalkeel v{} · tamper-evident receipt sha256: {}</div>
 </div></body></html>"##,
         esc(&r.title),
@@ -196,12 +224,13 @@ pub fn render_regress_html(r: &RegressEvalReport) -> String {
     let conf_html = if let Some(c) = &r.conformal {
         format!(
             r#"<div class="card"><h2>Conformal Prediction Interval ({} – {})</h2>
-            <p class="sub" style="margin:0">Empirical Coverage: <strong>{:.1}%</strong> · Below P10: <strong>{:.1}%</strong> · Above P90: <strong>{:.1}%</strong> · Mean Width: <strong>{:.2}</strong></p></div>"#,
+            <p class="sub" style="margin:0">Empirical Coverage: <strong>{:.1}%</strong> · Below P10: <strong>{:.1}%</strong> · Above P90: <strong>{:.1}%</strong> · Crossing: <strong>{:.1}%</strong> · Mean Width: <strong>{:.2}</strong></p></div>"#,
             esc(&c.p10_col),
             esc(&c.p90_col),
             c.empirical_coverage * 100.0,
             c.below_p10_rate * 100.0,
             c.above_p90_rate * 100.0,
+            c.crossing_rate * 100.0,
             c.mean_interval_width
         )
     } else {
@@ -221,6 +250,68 @@ pub fn render_regress_html(r: &RegressEvalReport) -> String {
     } else {
         String::new()
     };
+    let comp_html = if let Some(c) = &r.comparison {
+        format!(
+            r#"<div class="card"><h2>Head-to-Head vs Baseline ({})</h2>
+            <p class="sub" style="margin:0">Δ WMAPE: <strong>{:+.1}pp</strong> (baseline {:.1}%) · Δ MAE: <strong>{:+.2}</strong> (baseline {:.2}) · Baseline RMSE: <strong>{:.2}</strong></p></div>"#,
+            esc(&c.baseline_col),
+            c.delta_wmape * 100.0,
+            c.baseline_wmape * 100.0,
+            c.delta_mae,
+            c.baseline_mae,
+            c.baseline_rmse
+        )
+    } else {
+        String::new()
+    };
+    let groups_html = if let Some(gs) = &r.groups {
+        let rows: String = gs
+            .iter()
+            .map(|g| {
+                format!(
+                    r#"<tr><td><strong>{}</strong></td><td class="num">{}</td><td class="num">{:.1}%</td><td class="num">{:.2}</td><td class="num">{:.2}</td><td class="num">{:.4}</td><td class="num">{:+.2}</td></tr>"#,
+                    esc(&g.group),
+                    g.n,
+                    g.wmape * 100.0,
+                    g.mae,
+                    g.rmse,
+                    g.r2,
+                    g.bias
+                )
+            })
+            .collect();
+        format!(
+            r#"<div class="card"><h2>Subgroup Regression Breakdown</h2>
+            <table><thead><tr><th>Group</th><th class="num">N</th><th class="num">WMAPE</th><th class="num">MAE</th><th class="num">RMSE</th><th class="num">R²</th><th class="num">Bias</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    } else {
+        String::new()
+    };
+    let gates_html = if !r.gates.is_empty() {
+        let rows: String = r
+            .gates
+            .iter()
+            .map(|g| {
+                let pill = if g.passed {
+                    r#"<span class="pill ok">PASS</span>"#
+                } else {
+                    r#"<span class="pill bad">FAIL</span>"#
+                };
+                format!(
+                    r#"<tr><td><strong>{}</strong></td><td>{}</td><td class="num">{:.4}</td><td>{pill}</td></tr>"#,
+                    esc(&g.metric),
+                    esc(&g.rule),
+                    g.actual
+                )
+            })
+            .collect();
+        format!(
+            r#"<div class="card"><h2>CI Quality Gates</h2>
+            <table><thead><tr><th>Metric</th><th>Rule</th><th class="num">Actual</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -235,8 +326,11 @@ pub fn render_regress_html(r: &RegressEvalReport) -> String {
     <div class="kpi"><div class="lbl">R²</div><div class="val">{:.4}</div></div>
     <div class="kpi"><div class="lbl">Bias (Pred-Act)</div><div class="val">{:+.2}</div></div>
   </div>
+  {comp_html}
   {conf_html}
   {cap_html}
+  {groups_html}
+  {gates_html}
   <div class="foot">evalkeel v{} · tamper-evident receipt sha256: {}</div>
 </div></body></html>"#,
         esc(&r.title),

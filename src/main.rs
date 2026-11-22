@@ -14,6 +14,15 @@ use cli::{Cli, Command, ResolvedFormat};
 use io_data::read_table;
 use metrics::{evaluate_binary, evaluate_regress};
 use owo_colors::OwoColorize;
+use sha2::{Digest, Sha256};
+
+fn hash_file_sha256(path: &std::path::Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|e| format!("failed reading {}: {e}", path.display()))?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -61,10 +70,12 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             html: html_path,
             format,
         } => {
+            let input_sha = hash_file_sha256(&input)?;
             let table = read_table(&input)?;
             let report = evaluate_binary(
                 &table,
                 &input.display().to_string(),
+                &input_sha,
                 &y,
                 &p,
                 compare.as_deref(),
@@ -157,10 +168,12 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             html: html_path,
             format,
         } => {
+            let input_sha = hash_file_sha256(&input)?;
             let table = read_table(&input)?;
             let report = evaluate_regress(
                 &table,
                 &input.display().to_string(),
+                &input_sha,
                 &y,
                 &pred,
                 p10.as_deref(),

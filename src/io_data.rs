@@ -1,10 +1,12 @@
 //! Tabular dataset loader for CSV, TSV, JSONL/NDJSON, JSON array, and Apache Parquet.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use arrow_array::{Array, RecordBatch, cast::AsArray, types::*};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::DataType;
 use indexmap::IndexMap;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -17,11 +19,11 @@ pub struct DataTable {
 
 fn clean_cell(raw: &str) -> Option<String> {
     let t = raw.trim();
+    // Preserve valid categorical strings like "NA" (North America) and "None" (tier).
     if t.is_empty()
         || t.eq_ignore_ascii_case("null")
         || t.eq_ignore_ascii_case("nan")
-        || t.eq_ignore_ascii_case("none")
-        || t.eq_ignore_ascii_case("na")
+        || t.eq_ignore_ascii_case("n/a")
     {
         None
     } else {
@@ -59,6 +61,12 @@ fn read_delimited(path: &Path, delim: u8) -> Result<DataTable, String> {
         .iter()
         .map(|h| (h.clone(), Vec::new()))
         .collect();
+    if columns.len() != headers.len() {
+        return Err(format!(
+            "duplicate column header detected in {}",
+            path.display()
+        ));
+    }
     let mut row_count = 0usize;
     for rec in rdr.records() {
         let rec = rec.map_err(|e| format!("CSV parse error: {e}"))?;
@@ -154,52 +162,87 @@ fn read_parquet(path: &Path) -> Result<DataTable, String> {
         File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("failed to read parquet header: {e}"))?;
+    let schema = builder.schema().clone();
+    let mut seen = HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if !seen.insert(field.name().as_str()) {
+            return Err(format!(
+                "duplicate Parquet column `{}` in {}",
+                field.name(),
+                path.display()
+            ));
+        }
+    }
     let reader = builder
         .build()
         .map_err(|e| format!("failed to build parquet reader: {e}"))?;
+    let fmt_opts = FormatOptions::default();
 
-    let mut columns: IndexMap<String, Vec<Option<String>>> = IndexMap::new();
+    let mut columns: IndexMap<String, Vec<Option<String>>> = schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), Vec::new()))
+        .collect();
     let mut row_count = 0usize;
 
     for batch_res in reader {
         let batch: RecordBatch =
             batch_res.map_err(|e| format!("parquet batch read error: {e}"))?;
-        let schema = batch.schema();
+        let b_schema = batch.schema();
         let n = batch.num_rows();
-        for (col_idx, field) in schema.fields().iter().enumerate() {
+        for (col_idx, field) in b_schema.fields().iter().enumerate() {
             let arr = batch.column(col_idx);
+            let dt = field.data_type();
             let entry = columns.entry(field.name().clone()).or_default();
-            for row_idx in 0..n {
-                entry.push(arrow_val_to_option(arr.as_ref(), field.data_type(), row_idx));
+            match dt {
+                DataType::Float64 => {
+                    let a = arr.as_primitive::<Float64Type>();
+                    for row_idx in 0..n {
+                        if arr.is_null(row_idx) || a.value(row_idx).is_nan() {
+                            entry.push(None);
+                        } else {
+                            entry.push(Some(a.value(row_idx).to_string()));
+                        }
+                    }
+                }
+                DataType::Float32 => {
+                    let a = arr.as_primitive::<Float32Type>();
+                    for row_idx in 0..n {
+                        if arr.is_null(row_idx) || a.value(row_idx).is_nan() {
+                            entry.push(None);
+                        } else {
+                            entry.push(Some(a.value(row_idx).to_string()));
+                        }
+                    }
+                }
+                DataType::Boolean => {
+                    let a = arr.as_boolean();
+                    for row_idx in 0..n {
+                        if arr.is_null(row_idx) {
+                            entry.push(None);
+                        } else {
+                            entry.push(Some(if a.value(row_idx) { "1" } else { "0" }.to_string()));
+                        }
+                    }
+                }
+                _ => {
+                    let fmt = ArrayFormatter::try_new(arr.as_ref(), &fmt_opts).map_err(|e| {
+                        format!(
+                            "unsupported Parquet column `{}` ({dt:?}): {e}",
+                            field.name()
+                        )
+                    })?;
+                    for row_idx in 0..n {
+                        if arr.is_null(row_idx) {
+                            entry.push(None);
+                        } else {
+                            entry.push(clean_cell(&fmt.value(row_idx).to_string()));
+                        }
+                    }
+                }
             }
         }
         row_count += n;
     }
     Ok(DataTable { row_count, columns })
-}
-
-fn arrow_val_to_option(arr: &dyn Array, dt: &DataType, row: usize) -> Option<String> {
-    if arr.is_null(row) {
-        return None;
-    }
-    match dt {
-        DataType::Float64 => {
-            let v = arr.as_primitive::<Float64Type>().value(row);
-            if v.is_nan() { None } else { Some(v.to_string()) }
-        }
-        DataType::Float32 => {
-            let v = arr.as_primitive::<Float32Type>().value(row);
-            if v.is_nan() { None } else { Some(v.to_string()) }
-        }
-        DataType::Int64 => Some(arr.as_primitive::<Int64Type>().value(row).to_string()),
-        DataType::Int32 => Some(arr.as_primitive::<Int32Type>().value(row).to_string()),
-        DataType::Int16 => Some(arr.as_primitive::<Int16Type>().value(row).to_string()),
-        DataType::Int8 => Some(arr.as_primitive::<Int8Type>().value(row).to_string()),
-        DataType::UInt64 => Some(arr.as_primitive::<UInt64Type>().value(row).to_string()),
-        DataType::UInt32 => Some(arr.as_primitive::<UInt32Type>().value(row).to_string()),
-        DataType::Boolean => Some(if arr.as_boolean().value(row) { "1" } else { "0" }.to_string()),
-        DataType::Utf8 => clean_cell(arr.as_string::<i32>().value(row)),
-        DataType::LargeUtf8 => clean_cell(arr.as_string::<i64>().value(row)),
-        _ => None,
-    }
 }
