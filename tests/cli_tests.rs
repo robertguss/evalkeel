@@ -188,7 +188,16 @@ fn tie_aware_topk_strict_gates_crossing_quantiles_unclamped_logits_and_full_dige
     fs::write(&logit_csv, "y,p\n1,-0.5\n0,-3.0\n").unwrap();
     let lout = Command::cargo_bin("evalkeel")
         .unwrap()
-        .args(["binary", logit_csv.to_str().unwrap(), "--y", "y", "--p", "p", "--format", "agent"])
+        .args([
+            "binary",
+            logit_csv.to_str().unwrap(),
+            "--y",
+            "y",
+            "--p",
+            "p",
+            "--format",
+            "agent",
+        ])
         .assert()
         .success()
         .get_output()
@@ -230,12 +239,30 @@ fn tie_aware_topk_strict_gates_crossing_quantiles_unclamped_logits_and_full_dige
     // Gate without required columns exits 2
     Command::cargo_bin("evalkeel")
         .unwrap()
-        .args(["regress", cross_csv.to_str().unwrap(), "--y", "actual", "--pred", "p50", "--min-coverage", "0.8"])
+        .args([
+            "regress",
+            cross_csv.to_str().unwrap(),
+            "--y",
+            "actual",
+            "--pred",
+            "p50",
+            "--min-coverage",
+            "0.8",
+        ])
         .assert()
         .code(2);
     Command::cargo_bin("evalkeel")
         .unwrap()
-        .args(["binary", tie_csv.to_str().unwrap(), "--y", "y", "--p", "base_p", "--max-group-tpr-gap", "0.1"])
+        .args([
+            "binary",
+            tie_csv.to_str().unwrap(),
+            "--y",
+            "y",
+            "--p",
+            "base_p",
+            "--max-group-tpr-gap",
+            "0.1",
+        ])
         .assert()
         .code(2);
 
@@ -253,7 +280,18 @@ fn tie_aware_topk_strict_gates_crossing_quantiles_unclamped_logits_and_full_dige
     fs::write(&huge_csv, "actual,p50\n1e25,1e25\n1e25,1e25\n").unwrap();
     Command::cargo_bin("evalkeel")
         .unwrap()
-        .args(["regress", huge_csv.to_str().unwrap(), "--y", "actual", "--pred", "p50", "--cap", "1", "--format", "agent"])
+        .args([
+            "regress",
+            huge_csv.to_str().unwrap(),
+            "--y",
+            "actual",
+            "--pred",
+            "p50",
+            "--cap",
+            "1",
+            "--format",
+            "agent",
+        ])
         .assert()
         .success();
 
@@ -262,7 +300,18 @@ fn tie_aware_topk_strict_gates_crossing_quantiles_unclamped_logits_and_full_dige
     fs::write(&zero_csv, "actual,p50\n0,500\n0,500\n").unwrap();
     Command::cargo_bin("evalkeel")
         .unwrap()
-        .args(["regress", zero_csv.to_str().unwrap(), "--y", "actual", "--pred", "p50", "--max-wmape", "0.05", "--format", "agent"])
+        .args([
+            "regress",
+            zero_csv.to_str().unwrap(),
+            "--y",
+            "actual",
+            "--pred",
+            "p50",
+            "--max-wmape",
+            "0.05",
+            "--format",
+            "agent",
+        ])
         .assert()
         .code(1);
 }
@@ -272,7 +321,13 @@ fn skill_prints_and_installs() {
     let dir = tempdir().unwrap();
     Command::cargo_bin("evalkeel")
         .unwrap()
-        .args(["skill", "--install", dir.path().to_str().unwrap(), "--format", "human"])
+        .args([
+            "skill",
+            "--install",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "human",
+        ])
         .assert()
         .success();
     assert!(dir.path().join("evalkeel/SKILL.md").exists());

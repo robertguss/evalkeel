@@ -1,13 +1,13 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.10,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "evalkeel"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Zero-Python Rust ML model-agnostic backtest, calibration, conformal coverage, fairness parity & HTML Model Card CLI."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Robert Guss" }]
 keywords = ["ml", "evaluation", "calibration", "fairness", "cli", "keel"]
@@ -29,4 +29,5 @@ Issues = "https://github.com/robertguss/evalkeel/issues"
 
 [tool.maturin]
 bindings = "bin"
+compatibility = "pypi"
 strip = true

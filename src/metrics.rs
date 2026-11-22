@@ -576,7 +576,11 @@ pub fn evaluate_binary(
             .iter()
             .map(|(g, gp)| eval_subgroup_binary(g, gp, threshold))
             .collect();
-        let tprs: Vec<f64> = groups.iter().filter(|g| g.positives > 0).map(|g| g.tpr).collect();
+        let tprs: Vec<f64> = groups
+            .iter()
+            .filter(|g| g.positives > 0)
+            .map(|g| g.tpr)
+            .collect();
         let eces: Vec<f64> = groups.iter().map(|g| g.ece).collect();
         let aucs: Vec<f64> = groups.iter().filter_map(|g| g.roc_auc).collect();
         let span = |vals: &[f64]| -> f64 {
@@ -608,7 +612,9 @@ pub fn evaluate_binary(
             .ok_or_else(|| format!("fold column `{fcol}` not found"))?;
         let mut by_fold: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
         for (&ridx, &pair) in row_indices.iter().zip(pairs.iter()) {
-            let fname = fs_col[ridx].clone().unwrap_or_else(|| "(missing)".to_string());
+            let fname = fs_col[ridx]
+                .clone()
+                .unwrap_or_else(|| "(missing)".to_string());
             by_fold.entry(fname).or_default().push(pair);
         }
         Some(
@@ -700,8 +706,16 @@ pub fn evaluate_binary(
     let mut hasher = Sha256::new();
     hasher.update(input_sha256.as_bytes());
     hasher.update(b"|");
-    hasher.update(serde_json::to_string(&report).unwrap_or_default().as_bytes());
-    report.sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    hasher.update(
+        serde_json::to_string(&report)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    report.sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Ok(report)
 }
 
@@ -1044,7 +1058,15 @@ pub fn evaluate_regress(
     let mut hasher = Sha256::new();
     hasher.update(input_sha256.as_bytes());
     hasher.update(b"|");
-    hasher.update(serde_json::to_string(&report).unwrap_or_default().as_bytes());
-    report.sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    hasher.update(
+        serde_json::to_string(&report)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    report.sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Ok(report)
 }

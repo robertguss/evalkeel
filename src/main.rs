@@ -17,8 +17,7 @@ use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 
 fn hash_file_sha256(path: &std::path::Path) -> Result<String, String> {
-    let bytes =
-        fs::read(path).map_err(|e| format!("failed reading {}: {e}", path.display()))?;
+    let bytes = fs::read(path).map_err(|e| format!("failed reading {}: {e}", path.display()))?;
     let mut h = Sha256::new();
     h.update(&bytes);
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
@@ -96,7 +95,9 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             }
 
             match format.resolve() {
-                ResolvedFormat::Json => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+                ResolvedFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap())
+                }
                 ResolvedFormat::Agent => println!("{}", serde_json::to_string(&report).unwrap()),
                 ResolvedFormat::Human => {
                     let status = if report.gates_passed {
@@ -193,7 +194,9 @@ fn dispatch(cli: Cli) -> Result<u8, String> {
             }
 
             match format.resolve() {
-                ResolvedFormat::Json => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+                ResolvedFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap())
+                }
                 ResolvedFormat::Agent => println!("{}", serde_json::to_string(&report).unwrap()),
                 ResolvedFormat::Human => {
                     let status = if report.gates_passed {
